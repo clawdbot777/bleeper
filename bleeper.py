@@ -252,13 +252,47 @@ def identify_swearing_timestamps(in_video_name, swear_words):
         timestamps_data = json.load(f)
     swear_timestamps = []
     for segment in timestamps_data["segments"]:
-        for word in segment["words"]:
-            word_without_punct = ''.join(char for char in word["word"].lower() if char not in set(string.punctuation))            
+        words = segment.get("words", [])
+        for i, word in enumerate(words):
+            word_without_punct = ''.join(char for char in word["word"].lower() if char not in set(string.punctuation))
             if word_without_punct in (sw.lower().strip(string.punctuation) for sw in swear_words):
-                start_time = word["start"] - 0.02
-                end_time = word["end"] + 0.02
+                # Bug fix 1a: handle missing word-level timestamps (fast speech)
+                if "start" not in word or "end" not in word:
+                    # Fall back to segment boundaries as approximation
+                    start_time = segment["start"] - 0.02
+                    end_time = segment["end"] + 0.02
+                    print(f"Warning: missing timestamps for word '{word['word']}', using segment bounds {start_time:.2f}-{end_time:.2f}")
+                else:
+                    start_time = word["start"] - 0.02
+                    raw_end = word["end"]
+
+                    # Bug fix 2: cap end time to avoid bleeding into post-word silence.
+                    # WhisperX sometimes sets the last word's end = segment end, which
+                    # causes the beep to cover the entire trailing silence.
+                    max_word_duration = 1.2  # generous cap for any spoken word
+                    capped_end = min(raw_end, word["start"] + max_word_duration)
+
+                    # Also cap to start of the next word if available
+                    if i + 1 < len(words) and "start" in words[i + 1]:
+                        capped_end = min(capped_end, words[i + 1]["start"] - 0.05)
+
+                    end_time = capped_end + 0.02
+
                 swear_timestamps.append({"start": start_time, "end": end_time})
-    return swear_timestamps
+
+    # Bug fix 1b: merge overlapping or near-adjacent intervals (< 0.15s gap)
+    # prevents tiny audio bleed-through between rapid consecutive swear words
+    if not swear_timestamps:
+        return swear_timestamps
+    swear_timestamps.sort(key=lambda x: x["start"])
+    merged = [swear_timestamps[0]]
+    for current in swear_timestamps[1:]:
+        prev = merged[-1]
+        if current["start"] - prev["end"] < 0.15:
+            merged[-1]["end"] = max(prev["end"], current["end"])
+        else:
+            merged.append(current)
+    return merged
 
 # Function to get the inverse of the filter words timestamps
 def get_non_swearing_intervals(swear_timestamps, duration):
@@ -364,7 +398,10 @@ def replace_channel(out_video_name, out_video_ext, input_video, modified_audio_s
     ffmpeg_cmd = [
         "ffmpeg",
         "-i", input_video,
-        "-ss", audio_start_time,
+        # Bug fix 3: removed "-ss audio_start_time" here — the modified audio is already
+        # correctly timed (derived from the original stream). Seeking into it with -ss
+        # shifts the PTS, causing the MKV muxer to struggle with stream interleaving
+        # and manifesting as video freezing on the family audio track.
         "-i", modified_audio_stream,
         "-i", output_srt,
         "-map", "0:v",
